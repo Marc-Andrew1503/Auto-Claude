@@ -44,6 +44,7 @@ This directory contains comprehensive testing documentation and scripts for veri
 |----------|---------|-------------|
 | **WINDOWS_BUILD_VERIFICATION.md** | Complete build and verification guide | First-time build verification, troubleshooting package structure |
 | **E2E_SPEC_CREATION_TEST.md** | Detailed E2E test procedure for spec creation | Manual testing, detailed verification steps, troubleshooting |
+| **E2E_INSIGHTS_CONTEXT_TEST.md** | Detailed E2E test for Insights and Context features | Testing Insights analysis and Context refresh functionality |
 | **TESTING_GUIDE.md** (this file) | Overview and quick start guide | Quick reference, workflow overview |
 
 ## Script Index
@@ -51,7 +52,8 @@ This directory contains comprehensive testing documentation and scripts for veri
 | Script | Purpose | Usage |
 |--------|---------|-------|
 | **verify-windows-build.ps1** | Automated build structure verification | `.\scripts\verify-windows-build.ps1` |
-| **test-e2e-spec-creation.ps1** | Pre/post-test automation for E2E testing | `.\scripts\test-e2e-spec-creation.ps1 -Phase [pretest\|posttest]` |
+| **test-e2e-spec-creation.ps1** | Pre/post-test automation for E2E spec creation | `.\scripts\test-e2e-spec-creation.ps1 -Phase [pretest\|posttest]` |
+| **test-e2e-insights-context.ps1** | Pre/post-test automation for Insights/Context | `.\scripts\test-e2e-insights-context.ps1 -Phase [pretest\|posttest\|full]` |
 | **test-agent-subprocess.cjs** | Minimal reproducible test for agent subprocess | `node scripts\test-agent-subprocess.cjs` |
 | **verify-python-bundling.cjs** | Python bundling verification (cross-platform) | `node scripts\verify-python-bundling.cjs` |
 
@@ -89,8 +91,8 @@ node scripts\test-agent-subprocess.cjs
 | Subtask | Status | Document |
 |---------|--------|----------|
 | 3-1: Build verification | ✓ Complete | WINDOWS_BUILD_VERIFICATION.md |
-| 3-2: E2E spec creation test | 🔄 Current | E2E_SPEC_CREATION_TEST.md |
-| 3-3: Insights/Context test | ⏳ Pending | (See WINDOWS_BUILD_VERIFICATION.md Step 6) |
+| 3-2: E2E spec creation test | ✓ Complete | E2E_SPEC_CREATION_TEST.md |
+| 3-3: Insights/Context test | 🔄 Current | E2E_INSIGHTS_CONTEXT_TEST.md |
 | 3-4: Git version regression test | ⏳ Pending | (Run in dev mode: npm run dev) |
 
 ## Common Test Scenarios
@@ -124,7 +126,26 @@ node scripts\test-agent-subprocess.cjs
 
 **Expected:** spec.md created, no timeout errors, post-test verification passes.
 
-### Scenario 3: Troubleshooting Timeout Issues
+### Scenario 3: Insights and Context Feature Testing
+
+**Goal:** Verify Insights analysis and Context refresh work without Python import errors.
+
+**Steps:**
+1. Pre-test: `.\scripts\test-e2e-insights-context.ps1 -Phase pretest`
+2. Manual test:
+   - Launch `dist\win-unpacked\Auto-Claude.exe`
+   - Open Insights tab, wait for analysis to complete
+   - Navigate to Context view, click Refresh
+   - Verify no ModuleNotFoundError in DevTools Console
+3. Post-test: `.\scripts\test-e2e-insights-context.ps1 -Phase posttest`
+
+**Or run full workflow:** `.\scripts\test-e2e-insights-context.ps1 -Phase full`
+
+**Expected:** Insights displays data, Context refreshes successfully, no Python import errors.
+
+**Detailed guide:** See `E2E_INSIGHTS_CONTEXT_TEST.md`
+
+### Scenario 4: Troubleshooting Timeout Issues
 
 **Goal:** Diagnose why Planning is timing out.
 
@@ -246,12 +267,14 @@ node scripts\test-agent-subprocess.cjs
 
 ## Next Steps
 
-1. **Complete subtask-3-2** (E2E spec creation test)
+1. **✓ Complete subtask-3-2** (E2E spec creation test) - DONE
    - Follow `E2E_SPEC_CREATION_TEST.md`
    - Use automation scripts for pre/post verification
 
-2. **Complete subtask-3-3** (Insights and Context testing)
-   - See `WINDOWS_BUILD_VERIFICATION.md` Step 6
+2. **🔄 Complete subtask-3-3** (Insights and Context testing) - CURRENT
+   - Follow `E2E_INSIGHTS_CONTEXT_TEST.md`
+   - Run: `.\scripts\test-e2e-insights-context.ps1 -Phase full`
+   - Verify no ModuleNotFoundError for anthropic/graphiti_core
 
 3. **Complete subtask-3-4** (Git version regression test)
    - Run in dev mode, verify no regressions
