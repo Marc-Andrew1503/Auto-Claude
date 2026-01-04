@@ -66,18 +66,43 @@ class FullLocalModeTester:
     
     def __init__(self):
         self.results: List[Tuple[str, bool, str]] = []
-        # Windows: %APPDATA%\auto-claude, Linux/Mac: ~/.config/auto-claude
+        
+        # Auto-Claude can store settings in multiple locations
+        # Try to find the actual settings file
+        possible_paths = []
+        
         if platform.system() == 'Windows' or os.name == 'nt':
-            # Try APPDATA first, fallback to LOCALAPPDATA
-            appdata = os.environ.get('APPDATA') or os.environ.get('LOCALAPPDATA')
+            # Common Windows locations
+            appdata = os.environ.get('APPDATA')
             if appdata:
-                self.config_dir = Path(appdata) / "auto-claude"
-            else:
-                # Fallback to user profile
-                self.config_dir = Path.home() / "AppData" / "Roaming" / "auto-claude"
+                possible_paths.append(Path(appdata) / "auto-claude" / "settings.json")
+            
+            localappdata = os.environ.get('LOCALAPPDATA')
+            if localappdata:
+                possible_paths.append(Path(localappdata) / "auto-claude" / "settings.json")
+            
+            # Documents folder (where Auto-Claude UI actually stores it)
+            possible_paths.append(Path.home() / "Documents" / "auto-claude-ui" / "settings.json")
+            possible_paths.append(Path.home() / "AppData" / "Roaming" / "auto-claude" / "settings.json")
         else:  # Linux/Mac
-            self.config_dir = Path.home() / ".config" / "auto-claude"
-        self.settings_file = self.config_dir / "settings.json"
+            possible_paths.append(Path.home() / ".config" / "auto-claude" / "settings.json")
+            possible_paths.append(Path.home() / ".auto-claude" / "settings.json")
+        
+        # Find the first existing settings file
+        self.settings_file = None
+        for path in possible_paths:
+            if path.exists():
+                self.settings_file = path
+                self.config_dir = path.parent
+                break
+        
+        # If no settings file found, use default location
+        if not self.settings_file:
+            if platform.system() == 'Windows' or os.name == 'nt':
+                self.config_dir = Path.home() / "Documents" / "auto-claude-ui"
+            else:
+                self.config_dir = Path.home() / ".config" / "auto-claude"
+            self.settings_file = self.config_dir / "settings.json"
         
     def run_all_tests(self):
         """Run all test scenarios"""
