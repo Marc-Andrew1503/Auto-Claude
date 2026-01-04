@@ -6,6 +6,17 @@ import * as fs from 'fs';
 import { IPC_CHANNELS } from '../../shared/constants';
 import type { IPCResult } from '../../shared/types';
 import { getSettingsPath, readSettingsFile } from '../settings-utils';
+import { ClaudeProfileManager } from '../claude-profile-manager';
+
+// Singleton instance of ClaudeProfileManager
+let profileManager: ClaudeProfileManager | null = null;
+
+function getProfileManager(): ClaudeProfileManager {
+  if (!profileManager) {
+    profileManager = new ClaudeProfileManager();
+  }
+  return profileManager;
+}
 
 // Types for provider management
 export type Provider = 'claude' | 'ollama';
@@ -149,11 +160,11 @@ function getCPUInfo(): { model: string; cores: number; threads: number; percent:
   let totalTick = 0;
   for (const cpu of cpus) {
     for (const type in cpu.times) {
-      totalTick += (cpu.times as Record<string, number>)[type];
+      totalTick += cpu.times[type as keyof typeof cpu.times];
     }
     totalIdle += cpu.times.idle;
   }
-  const percent = totalTick > 0 ? Math.round((1 - totalIdle / totalTick) * 1000) / 10 : 0;
+  const percent = Math.round((1 - totalIdle / totalTick) * 1000) / 10;
 
   return { model, cores, threads, percent };
 }
@@ -175,14 +186,13 @@ function getRAMInfo(): { total_gb: number; used_gb: number; available_gb: number
 }
 
 /**
- * Check Ollama health
+ * Check Ollama health and available models
  */
 async function checkOllamaHealth(ollamaModel: string): Promise<ProviderHealth> {
   const startTime = Date.now();
 
   try {
-    const ollamaHost = process.env.OLLAMA_HOST || 'http://localhost:11434';
-    const response = await fetch(`${ollamaHost}/api/tags`, {
+    const response = await fetch('http://localhost:11434/api/tags', {
       method: 'GET',
       signal: AbortSignal.timeout(5000),
     });
@@ -196,12 +206,12 @@ async function checkOllamaHealth(ollamaModel: string): Promise<ProviderHealth> {
       };
     }
 
-    const data = await response.json() as { models?: Array<{ name: string }> };
+    const data = await response.json();
     const models = data.models || [];
-    const modelNames = models.map(m => m.name);
+    const modelNames = models.map((m: { name: string }) => m.name);
 
     // Check if the configured model is available
-    const modelAvailable = modelNames.some(name =>
+    const modelAvailable = modelNames.some((name: string) =>
       name === ollamaModel || name.startsWith(ollamaModel.split(':')[0])
     );
 
@@ -223,27 +233,68 @@ async function checkOllamaHealth(ollamaModel: string): Promise<ProviderHealth> {
 }
 
 /**
- * Check Claude health with proper rate limit detection
+ * Check Claude health using Claude Profile Manager
+ * This properly checks if the user has valid authentication through profiles
  */
 async function checkClaudeHealth(): Promise<ProviderHealth> {
   const startTime = Date.now();
 
-  // Check for OAuth token
-  const oauthToken = process.env.CLAUDE_CODE_OAUTH_TOKEN || process.env.ANTHROPIC_AUTH_TOKEN;
-  const apiKey = process.env.ANTHROPIC_API_KEY;
-
-  if (!oauthToken && !apiKey) {
-    return {
-      provider: 'claude',
-      status: 'unavailable',
-      model_available: false,
-      error_message: 'No Claude authentication configured (OAuth token or API key required)',
-    };
-  }
-
   try {
+    // Use Claude Profile Manager to check authentication
+    const pm = getProfileManager();
+    const activeProfile = pm.getActiveProfile();
+    
+    // Check if profile has valid authentication
+    const hasAuth = pm.hasValidAuth();
+    
+    if (!hasAuth) {
+      // Check if there's an API key in environment as fallback
+      const apiKey = process.env.ANTHROPIC_API_KEY;
+      if (!apiKey) {
+        return {
+          provider: 'claude',
+          status: 'unavailable',
+          model_available: false,
+          error_message: 'No Claude authentication found. Please authenticate via Claude Profile or set ANTHROPIC_API_KEY.',
+        };
+      }
+    }
+
+    // Check if profile is rate limited
+    const rateLimitStatus = pm.isProfileRateLimited(activeProfile.id);
+    if (rateLimitStatus.limited) {
+      const resetTime = rateLimitStatus.resetAt 
+        ? new Date(rateLimitStatus.resetAt).toLocaleTimeString() 
+        : 'unknown';
+      return {
+        provider: 'claude',
+        status: 'degraded',
+        model_available: true,
+        response_time_ms: Date.now() - startTime,
+        error_message: `Rate limited (${rateLimitStatus.type}). Resets at ${resetTime}`,
+      };
+    }
+
+    // Try to make a lightweight API call to verify connectivity
+    // Get the token from profile manager
+    const profileEnv = pm.getActiveProfileEnv();
+    const oauthToken = profileEnv.CLAUDE_CODE_OAUTH_TOKEN;
+    const apiKey = process.env.ANTHROPIC_API_KEY;
+
+    // If we have auth but no token to test with, assume available
+    // (the profile manager already validated auth)
+    if (!oauthToken && !apiKey) {
+      // Profile is authenticated via configDir, assume available
+      return {
+        provider: 'claude',
+        status: 'available',
+        model_available: true,
+        response_time_ms: Date.now() - startTime,
+        error_message: undefined,
+      };
+    }
+
     // Make a lightweight API call to check status
-    // Using the messages endpoint with minimal payload
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
       'anthropic-version': '2023-06-01',
@@ -280,14 +331,13 @@ async function checkClaudeHealth(): Promise<ProviderHealth> {
 
     if (response.status === 429) {
       // Rate limited - this is DEGRADED, not unavailable!
-      // The service is reachable, just temporarily limited
       const retryAfter = response.headers.get('retry-after');
       return {
         provider: 'claude',
         status: 'degraded',
         model_available: true,
         response_time_ms: responseTime,
-        error_message: `Rate limited${retryAfter ? `. Retry after ${retryAfter}s` : ''}. Service is reachable but temporarily limited.`,
+        error_message: `Rate limited${retryAfter ? `. Retry after ${retryAfter}s` : ''}`,
       };
     }
 
@@ -297,70 +347,81 @@ async function checkClaudeHealth(): Promise<ProviderHealth> {
         status: 'unavailable',
         model_available: false,
         response_time_ms: responseTime,
-        error_message: 'Authentication failed. Please check your API key or OAuth token.',
+        error_message: 'Authentication failed. Please re-authenticate your Claude profile.',
       };
     }
 
     if (response.status === 503 || response.status === 502 || response.status === 500) {
-      // Service temporarily unavailable - degraded, not unavailable
       return {
         provider: 'claude',
         status: 'degraded',
         model_available: true,
         response_time_ms: responseTime,
-        error_message: `Service temporarily unavailable (${response.status}). Will retry automatically.`,
+        error_message: `Service temporarily unavailable (${response.status})`,
       };
     }
 
     if (response.status === 529) {
-      // Overloaded - degraded
       return {
         provider: 'claude',
         status: 'degraded',
         model_available: true,
         response_time_ms: responseTime,
-        error_message: 'API is overloaded. Requests may be slower than usual.',
+        error_message: 'API is overloaded',
       };
     }
 
-    // Other errors
-    const errorBody = await response.text().catch(() => '');
+    // Other errors - still degraded if we have auth
     return {
       provider: 'claude',
       status: 'degraded',
       model_available: true,
       response_time_ms: responseTime,
-      error_message: `Unexpected response (${response.status}): ${errorBody.slice(0, 100)}`,
+      error_message: `Unexpected response (${response.status})`,
     };
 
   } catch (error) {
-    // Network errors - check if it's a timeout or connection issue
     const errorMessage = error instanceof Error ? error.message : 'Unknown error';
 
-    if (errorMessage.includes('timeout') || errorMessage.includes('ETIMEDOUT')) {
-      return {
-        provider: 'claude',
-        status: 'degraded',
-        model_available: true,
-        error_message: 'Request timed out. Service may be slow or overloaded.',
-      };
+    // Check if we have valid auth even if the API call failed
+    try {
+      const pm = getProfileManager();
+      if (pm.hasValidAuth()) {
+        // We have auth, so it's degraded not unavailable
+        if (errorMessage.includes('timeout') || errorMessage.includes('ETIMEDOUT')) {
+          return {
+            provider: 'claude',
+            status: 'degraded',
+            model_available: true,
+            error_message: 'Request timed out. Service may be slow.',
+          };
+        }
+        
+        if (errorMessage.includes('ECONNREFUSED') || errorMessage.includes('ENOTFOUND')) {
+          return {
+            provider: 'claude',
+            status: 'degraded',
+            model_available: true,
+            error_message: 'Cannot reach Anthropic API. Check internet connection.',
+          };
+        }
+
+        return {
+          provider: 'claude',
+          status: 'degraded',
+          model_available: true,
+          error_message: `Health check error: ${errorMessage}`,
+        };
+      }
+    } catch {
+      // Profile manager error, fall through
     }
 
-    if (errorMessage.includes('ECONNREFUSED') || errorMessage.includes('ENOTFOUND')) {
-      return {
-        provider: 'claude',
-        status: 'unavailable',
-        model_available: false,
-        error_message: 'Cannot connect to Anthropic API. Check your internet connection.',
-      };
-    }
-
-    // For other errors, assume degraded (reachable but having issues)
     return {
       provider: 'claude',
-      status: 'degraded',
-      model_available: true,
-      error_message: `Health check error: ${errorMessage}`,
+      status: 'unavailable',
+      model_available: false,
+      error_message: `Health check failed: ${errorMessage}`,
     };
   }
 }
@@ -505,29 +566,28 @@ export function registerProviderHandlers(): void {
         const fallbackProvider = settings.fallback_provider || 'ollama';
         const autoFallback = settings.auto_fallback !== false;
 
-        let currentProvider: Provider = primaryProvider;
+        let currentProvider = primaryProvider;
         let fallbackActive = false;
 
-        const primaryHealth = primaryProvider === 'claude' ? claudeHealth : ollamaHealth;
-        const fallbackHealth = primaryProvider === 'claude' ? ollamaHealth : claudeHealth;
+        // Check if we need to use fallback
+        if (autoFallback) {
+          const primaryHealth = primaryProvider === 'claude' ? claudeHealth : ollamaHealth;
+          const fallbackHealth = fallbackProvider === 'claude' ? claudeHealth : ollamaHealth;
 
-        if (primaryHealth.status === 'unavailable' && autoFallback && fallbackHealth.status !== 'unavailable') {
-          currentProvider = fallbackProvider;
-          fallbackActive = true;
+          if (primaryHealth.status === 'unavailable' && fallbackHealth.status !== 'unavailable') {
+            currentProvider = fallbackProvider;
+            fallbackActive = true;
+          }
         }
 
-        const currentModel = currentProvider === 'claude'
-          ? 'claude-sonnet-4-20250514'
-          : ollamaModel;
-
-        const info: ProviderInfo = {
+        const result: ProviderInfo = {
           current_provider: currentProvider,
           fallback_active: fallbackActive,
           primary_provider: primaryProvider,
           fallback_provider: fallbackProvider,
-          current_model: currentModel,
+          current_model: currentProvider === 'ollama' ? ollamaModel : 'claude-sonnet-4-20250514',
           max_parallel_agents: settings.max_parallel_agents || 12,
-          context_window: currentProvider === 'claude' ? 200000 : (settings.context_window || 8192),
+          context_window: settings.context_window || 8192,
           hardware_profile: null,
           auto_fallback_enabled: autoFallback,
           health: {
@@ -536,7 +596,7 @@ export function registerProviderHandlers(): void {
           },
         };
 
-        return { success: true, data: info };
+        return { success: true, data: result };
       } catch (error) {
         return {
           success: false,
@@ -549,17 +609,14 @@ export function registerProviderHandlers(): void {
   // Switch provider
   ipcMain.handle(
     IPC_CHANNELS.PROVIDER_SWITCH,
-    async (_, provider: Provider): Promise<IPCResult<{ success: boolean }>> => {
+    async (_event, provider: Provider): Promise<IPCResult<void>> => {
       try {
-        const settings = loadProviderSettings();
-        settings.primary_provider = provider;
-        const saved = saveProviderSettings(settings);
-
-        if (!saved) {
-          return { success: false, error: 'Failed to save provider settings' };
-        }
-
-        return { success: true, data: { success: true } };
+        const currentSettings = loadProviderSettings();
+        saveProviderSettings({
+          ...currentSettings,
+          primary_provider: provider,
+        });
+        return { success: true };
       } catch (error) {
         return {
           success: false,
@@ -596,27 +653,7 @@ export function registerProviderHandlers(): void {
     }
   );
 
-  // Check provider health
-  ipcMain.handle(
-    IPC_CHANNELS.PROVIDER_CHECK_HEALTH,
-    async (_, provider: Provider): Promise<IPCResult<ProviderHealth>> => {
-      try {
-        const settings = loadProviderSettings();
-        const health = provider === 'claude'
-          ? await checkClaudeHealth()
-          : await checkOllamaHealth(settings.ollama_model || 'llama3.1:8b-instruct-q4_K_M');
-
-        return { success: true, data: health };
-      } catch (error) {
-        return {
-          success: false,
-          error: error instanceof Error ? error.message : 'Failed to check provider health',
-        };
-      }
-    }
-  );
-
-  // Get recommended settings based on hardware
+  // Get recommended settings
   ipcMain.handle(
     IPC_CHANNELS.PROVIDER_GET_RECOMMENDED_SETTINGS,
     async (): Promise<IPCResult<RecommendedSettings>> => {
@@ -647,460 +684,88 @@ export function registerProviderHandlers(): void {
   // Save provider settings
   ipcMain.handle(
     IPC_CHANNELS.PROVIDER_SAVE_SETTINGS,
-    async (_, settings: Partial<ProviderSettings>): Promise<IPCResult<{ success: boolean }>> => {
+    async (_event, newSettings: Partial<ProviderSettings>): Promise<IPCResult<void>> => {
       try {
-        const saved = saveProviderSettings(settings);
-        if (!saved) {
-          return { success: false, error: 'Failed to save provider settings' };
-        }
-        return { success: true, data: { success: true } };
+        const currentSettings = loadProviderSettings();
+        saveProviderSettings({
+          ...currentSettings,
+          ...newSettings,
+        });
+        return { success: true };
       } catch (error) {
         return {
           success: false,
-          error: error instanceof Error ? error.message : 'Failed to save provider settings',
+          error: error instanceof Error ? error.message : 'Failed to save settings',
         };
       }
     }
   );
-}
 
-
-// ============================================
-// Execution Mode Types and Handlers
-// ============================================
-
-type ExecutionMode = 'local_only' | 'hybrid' | 'cloud_only';
-type TaskComplexity = 'trivial' | 'simple' | 'moderate' | 'complex' | 'expert';
-
-interface ModeConfig {
-  mode: ExecutionMode;
-  local_max_complexity: TaskComplexity;
-  hybrid_prefer_local: boolean;
-  hybrid_fallback_on_error: boolean;
-  hybrid_complexity_threshold: TaskComplexity;
-  auto_select_model: boolean;
-}
-
-interface OllamaModelInfo {
-  value: string;
-  label: string;
-  sublabel?: string;
-  family: string;
-  size_gb: number;
-  supports_code: boolean;
-  estimated_vram_gb: number;
-  parameter_size?: string;
-}
-
-interface ComplexityAnalysis {
-  complexity: TaskComplexity;
-  score: number;
-  factors: string[];
-  can_run_locally: boolean;
-  recommended_provider: 'claude' | 'ollama';
-}
-
-interface ModelSelection {
-  provider: 'claude' | 'ollama';
-  model: string;
-  reason: string;
-  fallback_available: boolean;
-  fallback_provider?: 'claude' | 'ollama';
-  fallback_model?: string;
-}
-
-// Execution mode config file path
-function getModeConfigPath(): string {
-  const settingsPath = getSettingsPath();
-  return path.join(path.dirname(settingsPath), 'execution-mode.json');
-}
-
-// Load execution mode config
-function loadModeConfig(): ModeConfig {
-  const configPath = getModeConfigPath();
-  const defaultConfig: ModeConfig = {
-    mode: 'hybrid',
-    local_max_complexity: 'moderate',
-    hybrid_prefer_local: true,
-    hybrid_fallback_on_error: true,
-    hybrid_complexity_threshold: 'moderate',
-    auto_select_model: true,
-  };
-
-  try {
-    if (fs.existsSync(configPath)) {
-      const data = fs.readFileSync(configPath, 'utf-8');
-      return { ...defaultConfig, ...JSON.parse(data) };
-    }
-  } catch (error) {
-    console.warn('[provider-handlers] Failed to load mode config:', error);
-  }
-
-  return defaultConfig;
-}
-
-// Save execution mode config
-function saveModeConfig(config: Partial<ModeConfig>): boolean {
-  const configPath = getModeConfigPath();
-  try {
-    const currentConfig = loadModeConfig();
-    const newConfig = { ...currentConfig, ...config };
-    fs.writeFileSync(configPath, JSON.stringify(newConfig, null, 2));
-    return true;
-  } catch (error) {
-    console.error('[provider-handlers] Failed to save mode config:', error);
-    return false;
-  }
-}
-
-// Get installed Ollama models
-async function getOllamaModels(): Promise<OllamaModelInfo[]> {
-  const models: OllamaModelInfo[] = [];
-
-  try {
-    const ollamaHost = process.env.OLLAMA_HOST || 'http://localhost:11434';
-    const response = await fetch(`${ollamaHost}/api/tags`, {
-      method: 'GET',
-      signal: AbortSignal.timeout(5000),
-    });
-
-    if (!response.ok) {
-      return models;
-    }
-
-    const data = await response.json() as { models?: Array<{ name: string; size: number; details?: { family?: string; parameter_size?: string } }> };
-    const ollamaModels = data.models || [];
-
-    for (const model of ollamaModels) {
-      const name = model.name;
-      const sizeGb = model.size / (1024 ** 3);
-      const family = model.details?.family || 'unknown';
-      const parameterSize = model.details?.parameter_size || '';
-
-      // Determine if model supports code
-      const supportsCode = name.toLowerCase().includes('code') ||
-        name.toLowerCase().includes('coder') ||
-        name.toLowerCase().includes('qwen') ||
-        name.toLowerCase().includes('deepseek') ||
-        name.toLowerCase().includes('starcoder');
-
-      // Estimate VRAM requirement (rough estimate: model size * 1.2 for overhead)
-      const estimatedVram = sizeGb * 1.2;
-
-      models.push({
-        value: name,
-        label: name.split(':')[0],
-        sublabel: parameterSize || `${sizeGb.toFixed(1)}GB`,
-        family,
-        size_gb: Math.round(sizeGb * 100) / 100,
-        supports_code: supportsCode,
-        estimated_vram_gb: Math.round(estimatedVram * 100) / 100,
-        parameter_size: parameterSize,
-      });
-    }
-  } catch (error) {
-    console.warn('[provider-handlers] Failed to get Ollama models:', error);
-  }
-
-  return models;
-}
-
-// Analyze task complexity
-function analyzeTaskComplexity(taskDescription: string, context?: { files?: string[]; codeSize?: number }): ComplexityAnalysis {
-  let score = 0;
-  const factors: string[] = [];
-
-  // Length-based scoring
-  const wordCount = taskDescription.split(/\s+/).length;
-  if (wordCount > 200) {
-    score += 2;
-    factors.push('Long description');
-  } else if (wordCount > 100) {
-    score += 1;
-    factors.push('Medium description');
-  }
-
-  // Keyword-based scoring
-  const complexKeywords = [
-    'architecture', 'refactor', 'redesign', 'migrate', 'integrate',
-    'security', 'performance', 'optimize', 'scale', 'distributed',
-    'microservices', 'database schema', 'api design', 'authentication',
-    'authorization', 'encryption', 'caching', 'load balancing'
-  ];
-
-  const moderateKeywords = [
-    'implement', 'create', 'build', 'develop', 'add feature',
-    'multiple files', 'component', 'service', 'module', 'class'
-  ];
-
-  const simpleKeywords = [
-    'fix', 'bug', 'typo', 'update', 'change', 'modify', 'edit',
-    'rename', 'move', 'delete', 'add comment', 'format'
-  ];
-
-  const lowerDesc = taskDescription.toLowerCase();
-
-  for (const keyword of complexKeywords) {
-    if (lowerDesc.includes(keyword)) {
-      score += 2;
-      factors.push(`Complex keyword: ${keyword}`);
-    }
-  }
-
-  for (const keyword of moderateKeywords) {
-    if (lowerDesc.includes(keyword)) {
-      score += 1;
-      factors.push(`Moderate keyword: ${keyword}`);
-    }
-  }
-
-  for (const keyword of simpleKeywords) {
-    if (lowerDesc.includes(keyword)) {
-      score -= 1;
-      factors.push(`Simple keyword: ${keyword}`);
-    }
-  }
-
-  // Context-based scoring
-  if (context?.files && context.files.length > 10) {
-    score += 2;
-    factors.push(`Many files: ${context.files.length}`);
-  } else if (context?.files && context.files.length > 5) {
-    score += 1;
-    factors.push(`Multiple files: ${context.files.length}`);
-  }
-
-  if (context?.codeSize && context.codeSize > 10000) {
-    score += 2;
-    factors.push('Large codebase');
-  } else if (context?.codeSize && context.codeSize > 5000) {
-    score += 1;
-    factors.push('Medium codebase');
-  }
-
-  // Determine complexity level
-  let complexity: TaskComplexity;
-  if (score <= 0) {
-    complexity = 'trivial';
-  } else if (score <= 2) {
-    complexity = 'simple';
-  } else if (score <= 5) {
-    complexity = 'moderate';
-  } else if (score <= 8) {
-    complexity = 'complex';
-  } else {
-    complexity = 'expert';
-  }
-
-  // Load mode config to determine if can run locally
-  const modeConfig = loadModeConfig();
-  const complexityOrder: TaskComplexity[] = ['trivial', 'simple', 'moderate', 'complex', 'expert'];
-  const complexityIndex = complexityOrder.indexOf(complexity);
-  const thresholdIndex = complexityOrder.indexOf(modeConfig.hybrid_complexity_threshold);
-  const localMaxIndex = complexityOrder.indexOf(modeConfig.local_max_complexity);
-
-  const canRunLocally = complexityIndex <= localMaxIndex;
-  const recommendedProvider = complexityIndex > thresholdIndex ? 'claude' : 'ollama';
-
-  return {
-    complexity,
-    score: Math.max(0, score),
-    factors,
-    can_run_locally: canRunLocally,
-    recommended_provider: recommendedProvider,
-  };
-}
-
-// Auto-select model based on task and hardware
-async function autoSelectModel(
-  taskDescription: string,
-  taskType: string = 'coding',
-  preferredProvider?: 'claude' | 'ollama'
-): Promise<ModelSelection> {
-  const modeConfig = loadModeConfig();
-  const complexity = analyzeTaskComplexity(taskDescription);
-  const gpus = await detectGPUs();
-  const ram = getRAMInfo();
-
-  // Check provider availability
-  const settings = loadProviderSettings();
-  const ollamaHealth = await checkOllamaHealth(settings.ollama_model || 'llama3.1:8b-instruct-q4_K_M');
-  const claudeHealth = await checkClaudeHealth();
-
-  const ollamaAvailable = ollamaHealth.status !== 'unavailable';
-  const claudeAvailable = claudeHealth.status !== 'unavailable';
-
-  // Determine provider based on mode
-  let provider: 'claude' | 'ollama';
-  let model: string;
-  let reason: string;
-  let fallbackAvailable = false;
-  let fallbackProvider: 'claude' | 'ollama' | undefined;
-  let fallbackModel: string | undefined;
-
-  if (modeConfig.mode === 'cloud_only') {
-    if (!claudeAvailable) {
-      return {
-        provider: 'claude',
-        model: 'sonnet',
-        reason: 'Cloud-only mode but Claude unavailable',
-        fallback_available: false,
-      };
-    }
-    provider = 'claude';
-    model = complexity.complexity === 'expert' ? 'opus' : 'sonnet';
-    reason = 'Cloud-only mode';
-  } else if (modeConfig.mode === 'local_only') {
-    if (!ollamaAvailable) {
-      return {
-        provider: 'ollama',
-        model: 'llama3.1:8b',
-        reason: 'Local-only mode but Ollama unavailable',
-        fallback_available: false,
-      };
-    }
-    if (!complexity.can_run_locally) {
-      return {
-        provider: 'ollama',
-        model: settings.ollama_model || 'llama3.1:8b',
-        reason: `Task too complex for local mode (${complexity.complexity})`,
-        fallback_available: false,
-      };
-    }
-    provider = 'ollama';
-    model = await selectBestOllamaModel(taskType, gpus, ram);
-    reason = 'Local-only mode';
-  } else {
-    // Hybrid mode
-    if (preferredProvider) {
-      provider = preferredProvider;
-    } else if (modeConfig.hybrid_prefer_local && ollamaAvailable && complexity.can_run_locally) {
-      provider = 'ollama';
-    } else if (complexity.recommended_provider === 'claude' && claudeAvailable) {
-      provider = 'claude';
-    } else if (ollamaAvailable) {
-      provider = 'ollama';
-    } else {
-      provider = 'claude';
-    }
-
-    if (provider === 'claude') {
-      model = complexity.complexity === 'expert' ? 'opus' : 'sonnet';
-      reason = `Hybrid mode: ${complexity.complexity} complexity`;
-      if (ollamaAvailable && modeConfig.hybrid_fallback_on_error) {
-        fallbackAvailable = true;
-        fallbackProvider = 'ollama';
-        fallbackModel = await selectBestOllamaModel(taskType, gpus, ram);
-      }
-    } else {
-      model = await selectBestOllamaModel(taskType, gpus, ram);
-      reason = `Hybrid mode: local preferred for ${complexity.complexity} complexity`;
-      if (claudeAvailable && modeConfig.hybrid_fallback_on_error) {
-        fallbackAvailable = true;
-        fallbackProvider = 'claude';
-        fallbackModel = 'sonnet';
-      }
-    }
-  }
-
-  return {
-    provider,
-    model,
-    reason,
-    fallback_available: fallbackAvailable,
-    fallback_provider: fallbackProvider,
-    fallback_model: fallbackModel,
-  };
-}
-
-// Select best Ollama model based on task and hardware
-async function selectBestOllamaModel(
-  taskType: string,
-  gpus: GPUInfo[],
-  ram: { total_gb: number; available_gb: number }
-): Promise<string> {
-  const models = await getOllamaModels();
-  if (models.length === 0) {
-    return 'llama3.1:8b-instruct-q4_K_M';
-  }
-
-  // Calculate available VRAM
-  const availableVram = gpus.length > 0
-    ? gpus.reduce((sum, gpu) => sum + gpu.vram_free_gb, 0)
-    : 0;
-
-  // Filter models that fit in VRAM/RAM
-  const maxVram = availableVram > 0 ? availableVram : ram.available_gb * 0.5;
-  const fittingModels = models.filter(m => m.estimated_vram_gb <= maxVram);
-
-  if (fittingModels.length === 0) {
-    // Return smallest model
-    const smallest = models.sort((a, b) => a.size_gb - b.size_gb)[0];
-    return smallest?.value || 'llama3.2:3b';
-  }
-
-  // For coding tasks, prefer code-specialized models
-  if (taskType === 'coding' || taskType === 'code') {
-    const codeModels = fittingModels.filter(m => m.supports_code);
-    if (codeModels.length > 0) {
-      // Return largest code model that fits
-      const best = codeModels.sort((a, b) => b.size_gb - a.size_gb)[0];
-      return best.value;
-    }
-  }
-
-  // Return largest general model that fits
-  const best = fittingModels.sort((a, b) => b.size_gb - a.size_gb)[0];
-  return best.value;
-}
-
-// Register execution mode handlers
-export function registerExecutionModeHandlers(): void {
-  // Get mode info
+  // Get execution mode
   ipcMain.handle(
-    IPC_CHANNELS.PROVIDER_GET_MODE_INFO,
-    async (): Promise<IPCResult<{ current_mode: ExecutionMode; config: ModeConfig }>> => {
+    IPC_CHANNELS.PROVIDER_GET_MODE,
+    async (): Promise<IPCResult<{ mode: string; config: Record<string, unknown> }>> => {
       try {
-        const config = loadModeConfig();
+        const settings = readSettingsFile();
         return {
           success: true,
           data: {
-            current_mode: config.mode,
-            config,
+            mode: settings.executionMode || 'hybrid',
+            config: {
+              preferLocal: settings.hybridPreferLocal !== false,
+              fallbackEnabled: settings.hybridFallbackEnabled !== false,
+              complexityThreshold: settings.hybridComplexityThreshold || 'moderate',
+              autoSelectModel: settings.autoSelectModel !== false,
+            },
           },
         };
       } catch (error) {
         return {
           success: false,
-          error: error instanceof Error ? error.message : 'Failed to get mode info',
+          error: error instanceof Error ? error.message : 'Failed to get execution mode',
         };
       }
     }
   );
 
-  // Set mode
+  // Update execution mode
   ipcMain.handle(
-    IPC_CHANNELS.PROVIDER_SET_MODE,
-    async (_, mode: ExecutionMode): Promise<IPCResult<{ success: boolean }>> => {
+    IPC_CHANNELS.PROVIDER_UPDATE_MODE,
+    async (_event, mode: string): Promise<IPCResult<void>> => {
       try {
-        const saved = saveModeConfig({ mode });
-        return { success: saved, data: { success: saved } };
+        const settingsPath = getSettingsPath();
+        const currentSettings = readSettingsFile();
+        const newSettings = {
+          ...currentSettings,
+          executionMode: mode,
+        };
+        fs.writeFileSync(settingsPath, JSON.stringify(newSettings, null, 2));
+        return { success: true };
       } catch (error) {
         return {
           success: false,
-          error: error instanceof Error ? error.message : 'Failed to set mode',
+          error: error instanceof Error ? error.message : 'Failed to update execution mode',
         };
       }
     }
   );
 
-  // Update mode config
+  // Update mode configuration
   ipcMain.handle(
     IPC_CHANNELS.PROVIDER_UPDATE_MODE_CONFIG,
-    async (_, config: Partial<ModeConfig>): Promise<IPCResult<{ success: boolean }>> => {
+    async (_event, config: Record<string, unknown>): Promise<IPCResult<void>> => {
       try {
-        const saved = saveModeConfig(config);
-        return { success: saved, data: { success: saved } };
+        const settingsPath = getSettingsPath();
+        const currentSettings = readSettingsFile();
+        const newSettings = {
+          ...currentSettings,
+          hybridPreferLocal: config.preferLocal,
+          hybridFallbackEnabled: config.fallbackEnabled,
+          hybridComplexityThreshold: config.complexityThreshold,
+          autoSelectModel: config.autoSelectModel,
+        };
+        fs.writeFileSync(settingsPath, JSON.stringify(newSettings, null, 2));
+        return { success: true };
       } catch (error) {
         return {
           success: false,
@@ -1110,12 +775,30 @@ export function registerExecutionModeHandlers(): void {
     }
   );
 
-  // Get Ollama models
+  // Get installed Ollama models
   ipcMain.handle(
     IPC_CHANNELS.PROVIDER_GET_OLLAMA_MODELS,
-    async (): Promise<IPCResult<OllamaModelInfo[]>> => {
+    async (): Promise<IPCResult<Array<{ name: string; size: string; modified: string }>>> => {
       try {
-        const models = await getOllamaModels();
+        const response = await fetch('http://localhost:11434/api/tags', {
+          method: 'GET',
+          signal: AbortSignal.timeout(5000),
+        });
+
+        if (!response.ok) {
+          return {
+            success: false,
+            error: `Ollama returned status ${response.status}`,
+          };
+        }
+
+        const data = await response.json();
+        const models = (data.models || []).map((m: { name: string; size: number; modified_at: string }) => ({
+          name: m.name,
+          size: `${(m.size / (1024 ** 3)).toFixed(1)}GB`,
+          modified: m.modified_at,
+        }));
+
         return { success: true, data: models };
       } catch (error) {
         return {
@@ -1126,29 +809,153 @@ export function registerExecutionModeHandlers(): void {
     }
   );
 
-  // Analyze task complexity
+  // Analyze task complexity (placeholder - would need actual implementation)
   ipcMain.handle(
     IPC_CHANNELS.PROVIDER_ANALYZE_TASK_COMPLEXITY,
-    async (_, taskDescription: string, context?: { files?: string[]; codeSize?: number }): Promise<IPCResult<ComplexityAnalysis>> => {
+    async (_event, taskDescription: string): Promise<IPCResult<{ complexity: string; score: number; factors: string[] }>> => {
       try {
-        const analysis = analyzeTaskComplexity(taskDescription, context);
-        return { success: true, data: analysis };
+        // Simple heuristic-based complexity analysis
+        const factors: string[] = [];
+        let score = 0;
+
+        // Check for complexity indicators
+        if (taskDescription.length > 500) {
+          score += 2;
+          factors.push('Long description');
+        }
+        if (/multi[- ]?file|multiple files/i.test(taskDescription)) {
+          score += 3;
+          factors.push('Multi-file changes');
+        }
+        if (/architect|design|refactor/i.test(taskDescription)) {
+          score += 4;
+          factors.push('Architecture work');
+        }
+        if (/database|migration|schema/i.test(taskDescription)) {
+          score += 3;
+          factors.push('Database changes');
+        }
+        if (/api|endpoint|integration/i.test(taskDescription)) {
+          score += 2;
+          factors.push('API work');
+        }
+        if (/test|spec|coverage/i.test(taskDescription)) {
+          score += 1;
+          factors.push('Testing required');
+        }
+        if (/bug|fix|error/i.test(taskDescription)) {
+          score -= 1;
+          factors.push('Bug fix (simpler)');
+        }
+
+        let complexity: string;
+        if (score <= 0) complexity = 'trivial';
+        else if (score <= 2) complexity = 'simple';
+        else if (score <= 5) complexity = 'moderate';
+        else if (score <= 8) complexity = 'complex';
+        else complexity = 'expert';
+
+        return {
+          success: true,
+          data: { complexity, score, factors },
+        };
       } catch (error) {
         return {
           success: false,
-          error: error instanceof Error ? error.message : 'Failed to analyze task complexity',
+          error: error instanceof Error ? error.message : 'Failed to analyze task',
         };
       }
     }
   );
 
-  // Auto-select model
+  // Auto-select model based on task and hardware
   ipcMain.handle(
     IPC_CHANNELS.PROVIDER_AUTO_SELECT_MODEL,
-    async (_, taskDescription: string, taskType?: string, preferredProvider?: 'claude' | 'ollama'): Promise<IPCResult<ModelSelection>> => {
+    async (_event, taskComplexity: string): Promise<IPCResult<{ provider: string; model: string; reason: string }>> => {
       try {
-        const selection = await autoSelectModel(taskDescription, taskType || 'coding', preferredProvider);
-        return { success: true, data: selection };
+        const gpus = await detectGPUs();
+        const ram = getRAMInfo();
+        const settings = loadProviderSettings();
+        const executionMode = readSettingsFile().executionMode || 'hybrid';
+
+        // If cloud only, always use Claude
+        if (executionMode === 'cloud_only') {
+          return {
+            success: true,
+            data: {
+              provider: 'claude',
+              model: 'claude-sonnet-4-20250514',
+              reason: 'Cloud-only mode enabled',
+            },
+          };
+        }
+
+        // Check Ollama availability
+        let ollamaAvailable = false;
+        try {
+          const response = await fetch('http://localhost:11434/api/tags', {
+            method: 'GET',
+            signal: AbortSignal.timeout(2000),
+          });
+          ollamaAvailable = response.ok;
+        } catch {
+          ollamaAvailable = false;
+        }
+
+        // If local only, must use Ollama
+        if (executionMode === 'local_only') {
+          if (!ollamaAvailable) {
+            return {
+              success: false,
+              error: 'Local-only mode but Ollama is not available',
+            };
+          }
+          
+          // Check if task is too complex for local
+          if (taskComplexity === 'expert' || taskComplexity === 'complex') {
+            return {
+              success: false,
+              error: `Task complexity (${taskComplexity}) exceeds local model capabilities`,
+            };
+          }
+
+          return {
+            success: true,
+            data: {
+              provider: 'ollama',
+              model: settings.ollama_model || 'llama3.1:8b-instruct-q4_K_M',
+              reason: 'Local-only mode enabled',
+            },
+          };
+        }
+
+        // Hybrid or automatic mode - decide based on complexity
+        const complexityThreshold = readSettingsFile().hybridComplexityThreshold || 'moderate';
+        const complexityOrder = ['trivial', 'simple', 'moderate', 'complex', 'expert'];
+        const taskIndex = complexityOrder.indexOf(taskComplexity);
+        const thresholdIndex = complexityOrder.indexOf(complexityThreshold);
+
+        // Use local if below threshold and Ollama is available
+        if (ollamaAvailable && taskIndex <= thresholdIndex) {
+          return {
+            success: true,
+            data: {
+              provider: 'ollama',
+              model: settings.ollama_model || 'llama3.1:8b-instruct-q4_K_M',
+              reason: `Task complexity (${taskComplexity}) within local capabilities`,
+            },
+          };
+        }
+
+        // Use Claude for complex tasks
+        return {
+          success: true,
+          data: {
+            provider: 'claude',
+            model: 'claude-sonnet-4-20250514',
+            reason: `Task complexity (${taskComplexity}) requires cloud provider`,
+          },
+        };
       } catch (error) {
         return {
           success: false,

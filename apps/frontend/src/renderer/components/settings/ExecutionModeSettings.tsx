@@ -164,31 +164,60 @@ export function ExecutionModeSettings({ className }: ExecutionModeSettingsProps)
     setLoading(true);
     try {
       // Load execution mode config
-      const modeInfo = await window.electronAPI?.provider?.getModeInfo?.();
-      if (modeInfo) {
-        setCurrentMode(modeInfo.current_mode);
-        if (modeInfo.config) {
-          setConfig(modeInfo.config);
+      const modeResult = await window.electronAPI?.provider?.getMode?.();
+      if (modeResult?.success && modeResult.data) {
+        setCurrentMode(modeResult.data.mode as ExecutionMode);
+        if (modeResult.data.config) {
+          setConfig(prev => ({
+            ...prev,
+            hybrid_prefer_local: modeResult.data.config.preferLocal ?? true,
+            hybrid_fallback_on_error: modeResult.data.config.fallbackEnabled ?? true,
+            hybrid_complexity_threshold: modeResult.data.config.complexityThreshold ?? 'moderate',
+            auto_select_model: modeResult.data.config.autoSelectModel ?? true,
+          }));
         }
       }
       
       // Load hardware info
-      const hwInfo = await window.electronAPI?.provider?.getHardware?.();
-      if (hwInfo) {
-        setHardware(hwInfo);
+      const hwResult = await window.electronAPI?.provider?.getHardware?.();
+      if (hwResult?.success && hwResult.data) {
+        const hw = hwResult.data;
+        setHardware({
+          gpu_available: hw.gpus && hw.gpus.length > 0,
+          gpu_name: hw.gpus?.[0]?.name || 'No GPU',
+          vram_total_gb: hw.gpus?.[0]?.vram_total_gb || 0,
+          vram_available_gb: hw.gpus?.[0]?.vram_free_gb || 0,
+          cpu_cores: hw.cpu?.cores || 0,
+          cpu_model: hw.cpu?.model || 'Unknown',
+          ram_total_gb: hw.ram?.total_gb || 0,
+          ram_available_gb: hw.ram?.available_gb || 0,
+          can_run_large_models: (hw.gpus?.[0]?.vram_total_gb || 0) >= 24,
+          can_run_medium_models: (hw.gpus?.[0]?.vram_total_gb || 0) >= 12,
+          can_run_small_models: (hw.gpus?.[0]?.vram_total_gb || 0) >= 4 || hw.ram?.total_gb >= 16,
+        });
       }
       
-      // Load provider status
-      const status = await window.electronAPI?.provider?.getInfo?.();
-      if (status) {
-        setOllamaAvailable(status.ollama_status?.health !== 'unavailable');
-        setClaudeAvailable(status.claude_status?.health !== 'unavailable');
+      // Load provider status - use the health check from getInfo
+      const infoResult = await window.electronAPI?.provider?.getInfo?.();
+      if (infoResult?.success && infoResult.data) {
+        const health = infoResult.data.health;
+        // Check status properly - 'available' or 'degraded' means usable
+        setOllamaAvailable(health?.ollama?.status === 'available' || health?.ollama?.status === 'degraded');
+        setClaudeAvailable(health?.claude?.status === 'available' || health?.claude?.status === 'degraded');
       }
       
       // Load Ollama models
-      const models = await window.electronAPI?.provider?.getOllamaModels?.();
-      if (models) {
-        setOllamaModels(models);
+      const modelsResult = await window.electronAPI?.provider?.getOllamaModels?.();
+      if (modelsResult?.success && modelsResult.data) {
+        setOllamaModels(modelsResult.data.map((m: { name: string; size: string }) => ({
+          value: m.name,
+          label: m.name,
+          sublabel: m.size,
+          family: m.name.split(':')[0],
+          size_gb: parseFloat(m.size) || 0,
+          supports_code: m.name.includes('code') || m.name.includes('qwen'),
+          estimated_vram_gb: parseFloat(m.size) || 0,
+        })));
       }
     } catch (error) {
       console.error('Failed to load execution mode data:', error);

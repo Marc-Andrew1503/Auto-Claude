@@ -280,6 +280,27 @@ export interface AppSettings {
   customIDEPath?: string;      // For 'custom' IDE
   preferredTerminal?: SupportedTerminal;
   customTerminalPath?: string; // For 'custom' terminal
+  
+  // Full Local Mode - replaces ALL cloud models with selected local model
+  fullLocalMode?: boolean;
+  fullLocalModel?: string;  // e.g., 'ollama:llama3.1:8b'
+  localModelAutoSelect?: boolean;  // Auto-select models based on task and hardware
+  localTaskModels?: Record<string, string>;  // Per-task model configuration
+  
+  // Execution Mode settings
+  executionMode?: 'local_only' | 'hybrid' | 'cloud_only' | 'automatic';
+  hybridPreferLocal?: boolean;
+  hybridFallbackEnabled?: boolean;
+  hybridComplexityThreshold?: 'trivial' | 'simple' | 'moderate' | 'complex' | 'expert';
+  autoSelectModel?: boolean;
+  
+  // AI Provider settings
+  aiProvider?: 'claude' | 'ollama';
+  aiFallbackProvider?: 'claude' | 'ollama';
+  aiAutoFallback?: boolean;
+  ollamaModel?: string;
+  maxParallelAgents?: number;
+  ollamaContextWindow?: number;
 }
 
 // Auto-Claude Source Environment Configuration (for auto-claude repo .env)

@@ -38,6 +38,7 @@ import {
 } from '../ui/card';
 import { toast } from '../../hooks/use-toast';
 import { ExecutionModeSettings } from './ExecutionModeSettings';
+import { FullLocalModeSettings } from './FullLocalModeSettings';
 
 // Types
 type Provider = 'claude' | 'ollama';
@@ -322,9 +323,9 @@ export function ProviderSettings() {
                   )}>
                     {providerInfo?.health.claude.status || 'checking'}
                   </span>
-                  {providerInfo?.health.claude.status === 'unavailable' && (
+                  {providerInfo?.health.claude.error_message && (
                     <span className="text-xs text-muted-foreground">
-                      (No token configured)
+                      ({providerInfo.health.claude.error_message})
                     </span>
                   )}
                 </div>
@@ -479,6 +480,19 @@ export function ProviderSettings() {
           </CardHeader>
           <CardContent>
             <ExecutionModeSettings />
+          </CardContent>
+        </Card>
+
+        {/* Full Local Mode Settings */}
+        <Card>
+          <CardHeader className="pb-3">
+            <CardTitle className="text-sm">Full Local Mode</CardTitle>
+            <CardDescription className="text-xs">
+              Replace all cloud models with local Ollama models
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            <FullLocalModeSettings />
           </CardContent>
         </Card>
 
