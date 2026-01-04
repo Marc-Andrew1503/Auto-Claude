@@ -1,6 +1,6 @@
 # Auto Claude
 ---------
-This fork implements local ollama integration still in testing, please use not for more then testing
+#This fork implements local ollama integration still in testing, please use not for more then testing
 
 ---------
 **Autonomous multi-agent coding framework that plans, builds, and validates software for you.**
